@@ -7,7 +7,7 @@ from tensorflow.python.keras.layers.recurrent import LSTM
 import matplotlib.pyplot as plt
 import pickle
 
-# This is to fix any distributed dataset issues
+# This is to fix any distributed dataset issues###
 from tensorflow.python.keras.engine import data_adapter
 
 def _is_distributed_dataset(ds):
