@@ -1,0 +1,9 @@
+yfinance>=0.2.18
+matplotlib>=3.5.2
+pandas>=1.4.3
+numpy>=1.21.5
+PyQt5>=5.15.7
+scikit-learn>=1.1.2
+tensorflow==2.12.0
+mplcursors>=0.5.2
+pickle-mixin>=1.0.2
