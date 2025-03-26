@@ -37,6 +37,7 @@ from utils import (
 )
 import psutil  # Add this import
 from tf_config import TensorFlowConfig
+from metrics import evaluate_predictions  # Add this import
 
 # Initialize TensorFlow configuration
 TensorFlowConfig.configure()
@@ -313,6 +314,145 @@ class PredictionThread(QThread):
             self.error_occurred.emit(str(e))
 
 
+class AccuracyEvaluationThread(QThread):
+    accuracy_calculated = pyqtSignal(dict)
+    error_occurred = pyqtSignal(str)
+    progress_updated = pyqtSignal(int)
+
+    def __init__(self, symbol, column_name="Close", test_days=3, custom_margin=None):
+        super().__init__()
+        self.symbol = symbol
+        self.column_name = column_name
+        self.test_days = test_days  # Number of days to use for accuracy testing
+        self.custom_margin = custom_margin  # Custom margin of error
+
+    def run(self):
+        try:
+            print(f"Starting accuracy evaluation for {self.symbol}...")
+            self.progress_updated.emit(10)
+
+            # Load model and scaler
+            model_path = f"{self.symbol}_model.h5"
+            scaler_path = f"{self.symbol}_scaler.pkl"
+
+            if not os.path.exists(model_path) or not os.path.exists(scaler_path):
+                raise FileNotFoundError(
+                    f"Model or scaler file not found for {self.symbol}"
+                )
+
+            model = load_model(model_path, compile=False)
+            model.compile(optimizer="adam", loss="mean_squared_error")
+
+            with open(scaler_path, "rb") as f:
+                scaler = pickle.load(f)
+
+            self.progress_updated.emit(30)
+
+            # Load historical data
+            df = pd.read_csv(f"{self.symbol}.csv")
+            if df.empty:
+                raise ValueError(f"No data available for {self.symbol}")
+
+            # Get the specified column data
+            if self.column_name not in df.columns:
+                raise ValueError(f"Column {self.column_name} not found in data")
+
+            data = df[self.column_name].values.reshape(-1, 1)
+
+            # We'll use only a portion of the data for testing
+            # Use 1-minute data, so 1440 minutes per day
+            test_size = min(self.test_days * 1440, len(data) // 2)
+            train_data = data[:-test_size]
+            test_data = data[-test_size:]
+
+            self.progress_updated.emit(50)
+
+            # Prepare the metrics
+            mae_list = []
+            mse_list = []
+            mape_list = []
+
+            # We'll make predictions at different points and compare
+            prediction_days = 60  # Must match the model's input window
+            prediction_window = 15  # 15-minute prediction window
+
+            # Process in batches to avoid memory issues
+            batch_size = 20
+            total_batches = min(
+                (test_size - prediction_days - prediction_window) // batch_size, 10
+            )
+
+            for batch in range(total_batches):
+                batch_predictions = []
+                batch_actuals = []
+
+                for i in range(batch_size):
+                    point = batch * batch_size + i
+                    if point + prediction_days + prediction_window >= len(test_data):
+                        break
+
+                    # Get sequence and actual future values
+                    sequence = test_data[point : point + prediction_days]
+                    actuals = test_data[
+                        point
+                        + prediction_days : point
+                        + prediction_days
+                        + prediction_window,
+                        0,
+                    ]
+
+                    # Scale the sequence
+                    scaled_sequence = scaler.transform(sequence)
+                    X_test = scaled_sequence.reshape(1, prediction_days, 1)
+
+                    # Predict
+                    scaled_predictions = model.predict(X_test, verbose=0)
+
+                    # Reshape and inverse transform
+                    scaled_predictions = scaled_predictions.reshape(-1, 1)
+                    predictions = scaler.inverse_transform(scaled_predictions).flatten()
+
+                    # Collect predictions and actuals
+                    batch_predictions.extend(predictions)
+                    batch_actuals.extend(actuals)
+
+                progress = 50 + int(50 * (batch + 1) / total_batches)
+                self.progress_updated.emit(progress)
+
+            # Convert to numpy arrays
+            predictions = np.array(batch_predictions)
+            actuals = np.array(batch_actuals)
+
+            # Use the enhanced evaluate_predictions function with custom margin
+            from metrics import evaluate_predictions, calculate_accuracy_with_margin
+
+            results = evaluate_predictions(actuals, predictions)
+
+            # Always add custom margin accuracy if specified
+            if self.custom_margin is not None:
+                # Format the key correctly
+                custom_margin_key = f"accuracy_{self.custom_margin}pct".replace(
+                    ".", "_"
+                )
+                # Calculate and add to results
+                results[custom_margin_key] = calculate_accuracy_with_margin(
+                    actuals, predictions, self.custom_margin
+                )
+                # Add a flag to indicate this was user-selected
+                results["user_selected_margin"] = self.custom_margin
+
+                print(
+                    f"Added custom margin accuracy for {self.custom_margin}%: {results[custom_margin_key]:.2f}%"
+                )
+
+            print("Accuracy evaluation completed")
+            self.accuracy_calculated.emit(results)
+
+        except Exception as e:
+            print(f"Error during accuracy evaluation: {str(e)}")
+            self.error_occurred.emit(str(e))
+
+
 # Main PyQt5 application
 class CryptoPredictionApp(QWidget):
     def __init__(self):
@@ -367,6 +507,24 @@ class CryptoPredictionApp(QWidget):
         self.layout.addWidget(self.column_dropdown)
         self.column_dropdown.setEnabled(False)  # Initially disable the dropdown
 
+        # Add margin of error settings
+        margin_frame = QFrame(self)
+        margin_layout = QHBoxLayout()
+        margin_label = QLabel("Margin of Error (%): ", self)
+
+        self.margin_dropdown = QComboBox(self)
+        margin_options = ["0", "0.1", "0.5", "1", "2", "5", "10", "15", "20"]
+        self.margin_dropdown.addItems(margin_options)
+        self.margin_dropdown.setCurrentText("5")  # Default to 5%
+        self.margin_dropdown.setStyleSheet(
+            "background-color: #ecf0f1; color: black; padding: 5px;"
+        )
+
+        margin_layout.addWidget(margin_label)
+        margin_layout.addWidget(self.margin_dropdown)
+        margin_frame.setLayout(margin_layout)
+        self.layout.addWidget(margin_frame)
+
         self.train_button = QPushButton("Train Model", self)
         self.train_button.clicked.connect(self.train_model)
         self.train_button.setStyleSheet(
@@ -382,6 +540,14 @@ class CryptoPredictionApp(QWidget):
             "QPushButton:disabled { background-color: #95a5a6; }"
         )
         self.layout.addWidget(self.predict_button)
+
+        self.accuracy_button = QPushButton("Evaluate Accuracy", self)
+        self.accuracy_button.clicked.connect(self.evaluate_accuracy)
+        self.accuracy_button.setStyleSheet(
+            "QPushButton { background-color: #9b59b6; padding: 8px; border-radius: 4px; }"
+            "QPushButton:disabled { background-color: #95a5a6; }"
+        )
+        self.layout.addWidget(self.accuracy_button)
 
         # Chart frame
         self.chart_frame = QFrame(self)
@@ -437,14 +603,11 @@ class CryptoPredictionApp(QWidget):
 
         except Exception as e:
             self.show_error_message(f"Critical error in fetch_data: {str(e)}")
-            # Recover from error
-            self.progress_bar.setValue(0)
-            if hasattr(self, "data_thread"):
-                delattr(self, "data_thread")
+            return
 
     def load_csv_columns(self, file_path):
-        # Load the CSV to get column names
         try:
+            # Load the CSV to get column names
             df = pd.read_csv(file_path)
             self.column_dropdown.clear()
             self.column_dropdown.addItems(df.columns)
@@ -466,6 +629,7 @@ class CryptoPredictionApp(QWidget):
             self.train_thread.training_completed.connect(self.handle_training_completed)
             self.train_thread.error_occurred.connect(self.handle_training_error)
             self.train_thread.progress_updated.connect(self.update_progress)
+
             self.progress_bar.setValue(0)
             self.train_thread.start()
 
@@ -536,8 +700,6 @@ class CryptoPredictionApp(QWidget):
                     fc="#34495e", alpha=0.8, edgecolor="white"
                 ),
             )
-
-            # Set annotation text color
             cursor.connect("add", lambda sel: sel.annotation.set_color("white"))
 
             # Set x-axis ticks and labels
@@ -551,23 +713,17 @@ class CryptoPredictionApp(QWidget):
 
             # Customize appearance
             ax.grid(True, linestyle="--", alpha=0.7)
+            ax.set_facecolor("#34495e")
+            fig.patch.set_facecolor("#2c3e50")
+            ax.set_xlabel("Time (minutes)", color="white", labelpad=10)
+            ax.set_ylabel("Price", color="white", labelpad=10)
             ax.set_title(
                 f"Predicted Prices for {self.symbol_dropdown.currentText()}",
                 color="white",
                 pad=20,
             )
-            ax.set_facecolor("#34495e")
-            fig.patch.set_facecolor("#2c3e50")
-
-            # Label axes
-            ax.set_xlabel("Time (minutes)", color="white", labelpad=10)
-            ax.set_ylabel("Price", color="white", labelpad=10)
-
-            # Style ticks
             ax.tick_params(axis="x", colors="white", rotation=45)
             ax.tick_params(axis="y", colors="white")
-
-            # Add legend
             ax.legend(loc="upper right")
 
             # Adjust layout to prevent label cutoff
@@ -648,6 +804,116 @@ class CryptoPredictionApp(QWidget):
 
         except Exception as e:
             self.show_error_message(f"Error loading CSV: {str(e)}")
+
+    def evaluate_accuracy(self):
+        try:
+            symbol = self.symbol_dropdown.currentData()
+
+            # Check if model exists
+            if not os.path.exists(f"{symbol}_model.h5"):
+                self.show_error_message(
+                    f"No trained model found for {symbol}. Please train a model first."
+                )
+                return
+
+            # Get column name if available
+            column_name = "Close"  # Default
+            if self.column_dropdown.isEnabled() and self.column_dropdown.currentText():
+                column_name = self.column_dropdown.currentText()
+
+            # Get user-selected margin of error
+            margin = float(self.margin_dropdown.currentText())
+
+            # Create and start the accuracy evaluation thread
+            self.accuracy_thread = AccuracyEvaluationThread(
+                symbol, column_name, test_days=3, custom_margin=margin
+            )
+            self.accuracy_thread.accuracy_calculated.connect(
+                self.display_accuracy_results
+            )
+            self.accuracy_thread.error_occurred.connect(self.show_error_message)
+            self.accuracy_thread.progress_updated.connect(self.update_progress)
+
+            # Disable button and update progress bar
+            self.accuracy_button.setEnabled(False)
+            self.progress_bar.setValue(0)
+
+            # Start the thread
+            self.accuracy_thread.start()
+
+        except Exception as e:
+            self.show_error_message(f"Error starting accuracy evaluation: {str(e)}")
+            self.accuracy_button.setEnabled(True)
+
+    def display_accuracy_results(self, results):
+        try:
+            # Format the results
+            mae = results["mae"]
+            mse = results["mse"]
+            rmse = results["rmse"]
+            mape = results["mape"]
+            accuracy_0pct = results.get("accuracy_0pct", 0.0)
+            accuracy_05pct = results.get("accuracy_0.5pct", 0.0)
+            accuracy_1pct = results.get("accuracy_1pct", 0.0)
+            accuracy_5pct = results.get("accuracy_5pct", 0.0)
+            accuracy_10pct = results.get("accuracy_10pct", 0.0)
+            directional_accuracy = results.get("directional_accuracy", 0.0)
+            sample_size = results["sample_size"]
+
+            # Get the user-selected margin of error
+            user_selected_margin = results.get("user_selected_margin")
+
+            # Build standard accuracies section
+            accuracy_section = (
+                f"Accuracy with margins of error:\n"
+                f"• ±0% margin: {accuracy_0pct:.2f}%\n"
+                f"• ±0.5% margin: {accuracy_05pct:.2f}%\n"
+                f"• ±1% margin: {accuracy_1pct:.2f}%\n"
+                f"• ±5% margin: {accuracy_5pct:.2f}%\n"
+                f"• ±10% margin: {accuracy_10pct:.2f}%\n"
+            )
+
+            # Always add the user selected margin if it exists and is not already covered
+            if user_selected_margin is not None and user_selected_margin not in [
+                0,
+                0.5,
+                1,
+                5,
+                10,
+            ]:
+                custom_margin_key = f"accuracy_{user_selected_margin}pct".replace(
+                    ".", "_"
+                )
+                custom_accuracy = results.get(custom_margin_key, 0.0)
+                accuracy_section += f"• ±{user_selected_margin}% margin: {custom_accuracy:.2f}% (selected)\n"
+
+            # Create a message with the results
+            message = (
+                f"Model Accuracy Metrics (sample size: {sample_size}):\n\n"
+                f"{accuracy_section}\n"
+                f"Price Direction Accuracy: {directional_accuracy:.2f}%\n\n"
+                f"Error Metrics:\n"
+                f"Mean Absolute Error (MAE): {mae:.6f}\n"
+                f"Mean Squared Error (MSE): {mse:.6f}\n"
+                f"Root Mean Squared Error (RMSE): {rmse:.6f}\n"
+                f"Mean Absolute Percentage Error (MAPE): {mape:.2f}%\n\n"
+                f"Higher percentages indicate better performance for accuracy metrics.\n"
+                f"Lower values indicate better performance for error metrics."
+            )
+
+            # Show the results
+            self.show_accuracy_message("Accuracy Results", message)
+
+        except Exception as e:
+            self.show_error_message(f"Error displaying accuracy results: {str(e)}")
+        finally:
+            # Re-enable the accuracy button
+            self.accuracy_button.setEnabled(True)
+
+    def show_accuracy_message(self, title, message):
+        msg = self.create_message_box(title, message)
+        msg.setStyleSheet("QLabel { min-width: 400px; }")
+        msg.exec_()
 
 
 if __name__ == "__main__":
